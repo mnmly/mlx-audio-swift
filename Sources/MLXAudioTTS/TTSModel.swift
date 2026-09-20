@@ -230,6 +230,13 @@ public enum TTS {
                 modelType: resolvedType,
                 pretrained: { try await SparkModel.fromPretrained($0, cache: $1) }
             )
+        case "vibevoice_streaming", "vibevoice_realtime":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await VibeVoiceModel.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try await VibeVoiceModel.fromModelDirectory(modelDir) }
+            )
         default:
             throw TTSModelError.unsupportedModelType(resolvedType)
         }
@@ -290,6 +297,10 @@ public enum TTS {
         let lower = modelRepo.lowercased()
         if lower.contains("breeze") && lower.contains("tts") {
             return "breeze"
+        }
+        // Must precede the generic qwen match below: the backbone is a Qwen2.
+        if lower.contains("vibevoice") {
+            return "vibevoice_streaming"
         }
         // Repo names are hyphenated (e.g. "Irodori-TTS-600M-…"); match the bare name.
         if lower.contains("spark") {
