@@ -153,24 +153,37 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         paddedToWholeFrames(normalizedSamples(audio))
     }
 
-    /// Longest audio this port transcribes reliably at bfloat16, in seconds.
+    /// Longest prompt slice fed to the language model in one forward pass.
     ///
-    /// Measured on a lecture recording: clean at two minutes, collapsed into a repetition
-    /// loop by three. PyTorch transcribes the same audio correctly at bfloat16, so this is
-    /// a limitation of this port rather than of the model.
-    static let bfloat16SafeDuration: Double = 120
+    /// Two reasons. The usual one: a bounded lazy graph keeps prefill memory flat, as
+    /// mlx-lm's `prefill_step_size` does. The essential one: mlx-swift 0.31.x (bundling MLX
+    /// 0.31.1) JIT-compiles the "NAX" split-K GEMM that M5-class GPUs use for a matmul once
+    /// M·N ≥ 2048², K ≥ 10240 and K ≥ 3·max(M, N) — this model's `down_proj` on any
+    /// prompt of ~1171 tokens or more — and instantiates that kernel with the float32
+    /// accumulator's type instead of the input's, so it reads bfloat16/float16 activations
+    /// as float32 and returns garbage. Every layer's MLP is corrupted at once, and greedy
+    /// decoding degenerates into a repetition loop from the first token; float32 is only
+    /// unaffected because there the two types coincide. Fixed upstream in MLX ≥ 0.32.0
+    /// (ml-explore/mlx#3810), which no mlx-swift release bundles yet. Keeping every slice's
+    /// M·N under 2048² never reaches that kernel; once the dependency moves past the fix,
+    /// this can be relaxed to a plain memory bound.
+    var prefillStepSize: Int {
+        Swift.min(1024, (2048 * 2048 - 1) / config.textConfig.hiddenSize)
+    }
 
-    private func warnIfPrecisionIsRisky(sampleCount: Int) {
-        let duration = Double(sampleCount) / Double(config.samplingRate)
-        guard lmHead.weight.dtype != .float32, duration > Self.bfloat16SafeDuration else {
-            return
+    /// Runs the prompt through the language model in bounded slices, returning the hidden
+    /// states of the final slice.
+    func prefill(_ embeds: MLXArray, cache: [KVCache]) -> MLXArray {
+        let total = embeds.dim(1)
+        let step = prefillStepSize
+        var start = 0
+        while start + step < total {
+            let slice = embeds[0..., start ..< (start + step), 0...]
+            eval(languageModel(inputsEmbeds: slice, cache: cache))
+            Memory.clearCache()
+            start += step
         }
-        FileHandle.standardError.write(Data("""
-            [mlx-audio] VibeVoice ASR: \(Int(duration))s of audio at bfloat16. Past about \
-            \(Int(Self.bfloat16SafeDuration))s this port degenerates into a repetition loop; \
-            load with precision: .float32 (or --precision float32) for long recordings.
-
-            """.utf8))
+        return languageModel(inputsEmbeds: embeds[0..., start..., 0...], cache: cache)
     }
 
     /// Zero-pads to the next whole 3200-sample frame.
@@ -256,35 +269,42 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         onTokenID: ((Int) -> Void)? = nil
     ) -> STTOutput {
         let start = Date()
-        warnIfPrecisionIsRisky(sampleCount: audio.size)
         let features = encodeAudio(audio)
         let duration = Double(audio.size) / Double(config.samplingRate)
 
         let (embeds, promptLength) = buildPromptEmbeddings(features: features, duration: duration)
-        let prefillEnd = Date()
 
         var text = ""
         var generated = 0
         let cache = languageModel.makeCache()
-
-        var hidden = languageModel(inputsEmbeds: embeds, cache: cache)
         let eos = tokenizer.eosTokenId ?? 151_643
         var pieces: [Int] = []
-        var token = nextToken(hidden, parameters: generationParameters, generated: pieces)
 
-        while generated < generationParameters.maxTokens, token != eos {
+        var hidden = prefill(embeds, cache: cache)
+        var next = nextToken(hidden, parameters: generationParameters, generated: pieces)
+        asyncEval(next)
+        let prefillEnd = Date()
+
+        // Pipelined decode, as mlx-lm does it: the forward for token n+1 is queued before
+        // token n is read back, so the GPU works while the host decodes text and checks for
+        // termination. Reading `next` is the only synchronisation point per step.
+        while generated < generationParameters.maxTokens {
+            let token = next.item(Int.self)
+            if token == eos { break }
             pieces.append(token)
             generated += 1
             onToken(tokenizer.decode(tokens: [token]))
             onTokenID?(token)
 
             if Self.isDegenerate(pieces, parameters: generationParameters) { break }
+            if generated == generationParameters.maxTokens { break }
 
-            let ids = MLXArray([Int32(token)], [1, 1])
-            hidden = languageModel(inputsEmbeds: languageModel.embed(ids), cache: cache)
-            token = nextToken(hidden, parameters: generationParameters, generated: pieces)
+            hidden = languageModel(
+                inputsEmbeds: languageModel.embed(next.reshaped([1, 1])), cache: cache)
+            next = nextToken(hidden, parameters: generationParameters, generated: pieces)
+            asyncEval(next)
 
-            if generated % 50 == 0 { Memory.clearCache() }
+            if generated % 256 == 0 { Memory.clearCache() }
         }
 
         text = tokenizer.decode(tokens: pieces)
@@ -350,11 +370,12 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         return (embeds, prefix.count + frames + suffix.count)
     }
 
+    /// The next token as a lazy `[1]` int32 array, so the caller can queue its evaluation.
     func nextToken(
         _ hidden: MLXArray,
         parameters: STTGenerateParameters,
         generated: [Int]
-    ) -> Int {
+    ) -> MLXArray {
         var logits = lmHead(hidden[0..., -1, 0...])
         if parameters.temperature > 0 { logits = logits / parameters.temperature }
         logits = Self.applyRepetitionPenalty(
@@ -363,9 +384,9 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
             contextSize: parameters.repetitionContextSize)
 
         if parameters.temperature <= 0 {
-            return MLX.argMax(logits, axis: -1).item(Int.self)
+            return MLX.argMax(logits, axis: -1).asType(.int32)
         }
-        return MLXRandom.categorical(logits).item(Int.self)
+        return MLXRandom.categorical(logits).asType(.int32)
     }
 
     /// Sign-aware repetition penalty, matching the mlx-lm convention already used by
@@ -402,15 +423,14 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
 
     /// Precision to run the language model at.
     ///
-    /// The checkpoint is bfloat16 and that is fine for short clips, but greedy decoding
-    /// degenerates into a repetition loop on longer audio: on a lecture recording it holds
-    /// up to about two minutes and collapses by three, where float32 transcribes the same
-    /// audio cleanly and matches the reference word for word. float32 doubles the weights
-    /// to roughly 33 GB.
+    /// The checkpoint is bfloat16 and transcribes correctly at that precision, long
+    /// recordings included, now that prompts are prefilled in slices (see
+    /// `prefillStepSize`). float32 remains available for comparisons against the reference
+    /// implementation; it doubles the weights to roughly 33 GB.
     public enum Precision: String, Sendable {
-        /// The checkpoint's own precision. Fast and compact; use for short audio.
+        /// The checkpoint's own precision. Fast and compact.
         case bfloat16
-        /// Matches the reference implementation. Needed for long recordings.
+        /// The reference implementation's float32 path, at twice the memory.
         case float32
     }
 
