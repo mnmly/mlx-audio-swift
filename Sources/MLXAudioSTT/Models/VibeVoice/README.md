@@ -31,7 +31,20 @@ Two details that are easy to get wrong:
 
 `STTOutput.segments` carries `start`/`end` (what this package's CLI and its SRT/VTT writers
 read) alongside `start_time`/`end_time` (what upstream's post-processing returns), plus
-`speaker_id`. `STTOutput.text` is the flattened `speaker: text` transcript.
+`speaker_id` where the model assigned one. `STTOutput.text` is the flattened
+`speaker: text` transcript.
+
+```
+$ mlx-audio-swift-stt --model microsoft/VibeVoice-ASR-HF --audio two-people.wav \
+    --output-path out --format json
+  [ 0.00- 6.46]  speaker -    [Silence]
+  [ 6.46- 7.22]  speaker 0    Hello.
+  [ 7.34- 8.41]  speaker 1    Hello.
+  [ 8.06-10.04]  speaker 0    Oh, hello, I didn't know you were there.
+```
+
+Note that SRT and VTT have no way to express a speaker, so those formats carry the text and
+timings only; use `--format json` to keep the attribution.
 
 Audio longer than 60 s is encoded in segments (`acoustic_tokenizer_chunk_size`), carrying
 convolution state across them, which is upstream's workaround for the convolution stack's
