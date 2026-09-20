@@ -268,8 +268,10 @@ struct VibeVoiceASRLongAudioTests {
         let duration = Double(audio.size) / 24000
         #expect(duration > 150, "This test is about audio long enough to trigger the collapse")
 
+        // At the checkpoint's own precision: the collapse this guards against came from a
+        // half-precision-only GEMM defect, so a float32 run here would prove nothing.
         let model = try await VibeVoiceASRModel.fromModelDirectory(
-            URL(fileURLWithPath: modelDir), precision: .float32)
+            URL(fileURLWithPath: modelDir))
 
         let output = model.generate(
             audio: audio,

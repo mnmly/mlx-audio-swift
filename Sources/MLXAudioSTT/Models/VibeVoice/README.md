@@ -54,11 +54,18 @@ frame holding only a handful of real samples came out badly wrong without it.
 
 ## Precision, and long recordings
 
-The checkpoint is bfloat16 and that is fine for short clips, but **greedy decoding
-degenerates into a repetition loop on long audio**. On a lecture recording it holds up to
-about two minutes and collapses by three, emitting `"I mean, I mean, I mean…"` instead of a
-transcript. `precision: .float32` transcribes the same audio cleanly and matches the
-reference word for word, at the cost of doubling the weights to roughly 33 GB:
+The checkpoint is bfloat16 and this port runs it at that precision by default, on recordings
+of any length. Earlier versions collapsed into a repetition loop (`"I mean, I mean, I
+mean…"`) on audio past about two minutes at bfloat16, and only float32 was reliable. That was
+not a precision problem: mlx-swift 0.31.x JIT-compiles the "NAX" split-K GEMM that M5-class
+GPUs use for a matmul once `M·N ≥ 2048²`, `K ≥ 10240` and `K ≥ 3·max(M, N)` — this model's
+`down_proj` (K = 18944, N = 3584) on any prompt of ~1171 tokens or more — with the float32
+accumulator's type in place of the input's, so it read bfloat16 activations as float32 and
+returned garbage. Fixed upstream in MLX 0.32.0 (ml-explore/mlx#3810), which no mlx-swift
+release bundles yet. The prompt is therefore prefilled in slices whose `M·N` stays under
+2048² (1024 tokens for this hidden size), which never reaches that kernel and, as in mlx-lm,
+also keeps prefill memory flat. `precision: .float32` remains available for comparisons
+against the reference, at twice the memory:
 
 ```swift
 let model = try await VibeVoiceASRModel.fromPretrained(
@@ -67,24 +74,32 @@ let model = try await VibeVoiceASRModel.fromPretrained(
 
 The audio encoders are always float32 regardless, because they are ~33 convolutions deep and
 bfloat16 accumulates through them badly — 40.7 dB SNR against the reference versus 68.2 dB.
-That alone does not prevent the collapse, which comes from the language model, but it costs
-about a gigabyte and there is no reason to give up the accuracy.
+The two encoders are a small part of an 8B model, so this costs about a gigabyte.
 
 Two safeguards apply either way: `repetitionPenalty` / `repetitionContextSize` from
 `STTGenerateParameters` are honoured, and for greedy callers (penalty 1.0, which has no way
 to escape a loop) generation stops once the last 24 tokens contain almost no distinct
 values, rather than spending the whole token budget repeating a phrase.
 
-The CLI runs bfloat16, so use the Swift API for long recordings — or split the audio and
-transcribe in parts, which is cheaper anyway: generation cost grows with context, so one
-pass over hours of audio is far slower than the sum of its parts.
+Generation cost grows with context, so one pass over hours of audio is far slower than
+transcribing it in parts.
 
 ## Verifying against the reference
 
 `Tests/VibeVoiceASRParityTests.swift` compares against PyTorch on real weights, gated behind
 two environment variables. Set `vae_std = 0` on the reference first — the acoustic VAE
 samples at inference, so without that its own latents differ run to run by ~2.6% and the
-comparison measures noise rather than correctness.
+comparison measures noise rather than correctness. The fixture (`gen_asr_fixture.py` in the
+test's doc comment) is a safetensors file holding `audio` (24 kHz float32), `features` (the
+reference's acoustic latents, `[frames, 64]`) and `generated_ids`, produced with
+`transformers`' native `VibeVoiceAsrForConditionalGeneration` in float32:
+
+```python
+model.config.acoustic_tokenizer_encoder_config.vae_std = 0.0
+inputs = processor.apply_transcription_request(audio=wav)
+latents = model.get_audio_features(input_values=inputs["input_values"]).last_hidden_state
+ids = model.generate(**inputs, max_new_tokens=2048, do_sample=False)[0, inputs["input_ids"].shape[1]:]
+```
 
 With sampling disabled the acoustic latents match at **66 dB SNR, correlation 1.0** — both
 for a 30 s clip and for a 90 s one, which crosses the 60 s segmentation threshold and comes
