@@ -40,6 +40,12 @@ public final class VibeVoiceASRStreamSession {
     public let maxTokensPerChunk: Int
     public var temperature: Float = 0
 
+    /// Repetition penalty applied within a chunk, as upstream's streaming loop does.
+    /// The context resets at each chunk boundary, so a repeated phrase across chunks is
+    /// left alone — only a loop inside one chunk is penalised.
+    public var repetitionPenalty: Float = 1.0
+    public var repetitionContextSize: Int = 32
+
     public init(
         model: VibeVoiceASRModel,
         contextInfo: String? = nil,
@@ -121,16 +127,29 @@ public final class VibeVoiceASRStreamSession {
         var tokens: [Int] = []
 
         for _ in 0 ..< maxTokensPerChunk {
-            let logits = model.lmHead(hidden[0..., -1, 0...])
+            var logits = model.lmHead(hidden[0..., -1, 0...])
+            if temperature > 0 { logits = logits / temperature }
+            logits = VibeVoiceASRModel.applyRepetitionPenalty(
+                logits, generated: tokens,
+                penalty: repetitionPenalty, contextSize: repetitionContextSize)
+
             let token: Int
             if temperature <= 0 {
                 token = MLX.argMax(logits, axis: -1).item(Int.self)
             } else {
-                token = MLXRandom.categorical(logits / temperature).item(Int.self)
+                token = MLXRandom.categorical(logits).item(Int.self)
             }
 
             if token == textChunkEndID || token == eosID { break }
             tokens.append(token)
+
+            // Without a penalty a greedy chunk can loop until it hits the cap; end it
+            // rather than spend the whole budget on one repeated phrase.
+            if repetitionPenalty == 1.0, tokens.count >= 24,
+                Set(tokens.suffix(24)).count <= 3
+            {
+                break
+            }
 
             let embed = model.languageModel.embed(MLXArray([Int32(token)], [1, 1]))
             hidden = model.languageModel(inputsEmbeds: embed, cache: cache)

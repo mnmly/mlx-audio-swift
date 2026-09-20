@@ -48,7 +48,36 @@ timings only; use `--format json` to keep the attribution.
 
 Audio longer than 60 s is encoded in segments (`acoustic_tokenizer_chunk_size`), carrying
 convolution state across them, which is upstream's workaround for the convolution stack's
-32-bit indexing.
+32-bit indexing. Input is zero-padded to a whole number of 3200-sample frames first: the
+offline convolution path ceil-pads internally but the segmented one does not, and a final
+frame holding only a handful of real samples came out badly wrong without it.
+
+## Precision, and long recordings
+
+The checkpoint is bfloat16 and that is fine for short clips, but **greedy decoding
+degenerates into a repetition loop on long audio**. On a lecture recording it holds up to
+about two minutes and collapses by three, emitting `"I mean, I mean, I mean…"` instead of a
+transcript. `precision: .float32` transcribes the same audio cleanly and matches the
+reference word for word, at the cost of doubling the weights to roughly 33 GB:
+
+```swift
+let model = try await VibeVoiceASRModel.fromPretrained(
+    "microsoft/VibeVoice-ASR-HF", precision: .float32)
+```
+
+The audio encoders are always float32 regardless, because they are ~33 convolutions deep and
+bfloat16 accumulates through them badly — 40.7 dB SNR against the reference versus 68.2 dB.
+That alone does not prevent the collapse, which comes from the language model, but it costs
+about a gigabyte and there is no reason to give up the accuracy.
+
+Two safeguards apply either way: `repetitionPenalty` / `repetitionContextSize` from
+`STTGenerateParameters` are honoured, and for greedy callers (penalty 1.0, which has no way
+to escape a loop) generation stops once the last 24 tokens contain almost no distinct
+values, rather than spending the whole token budget repeating a phrase.
+
+The CLI runs bfloat16, so use the Swift API for long recordings — or split the audio and
+transcribe in parts, which is cheaper anyway: generation cost grows with context, so one
+pass over hours of audio is far slower than the sum of its parts.
 
 ## Verifying against the reference
 

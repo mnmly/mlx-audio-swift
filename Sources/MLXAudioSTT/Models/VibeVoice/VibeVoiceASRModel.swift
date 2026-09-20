@@ -102,13 +102,22 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
 
     /// Audio (mono, 24 kHz) to language-model embeddings, one per 3200 samples.
     public func encodeAudio(_ audio: MLXArray) -> MLXArray {
-        let samples = normalizedSamples(audio)
+        // Pad up to a whole number of 3200-sample frames before encoding.
+        //
+        // The offline convolution path already ceil-pads internally, but the segmented one
+        // used for long audio does not, so a final frame covering only a handful of real
+        // samples came out wrong — measured against the reference on a 180 s clip whose
+        // last frame held 32 samples, that single frame dragged the latents from 68 dB SNR
+        // down to 37 dB. Zero-padding here makes every level's length an exact multiple of
+        // its remaining hop, so no level needs its own alignment padding and both paths
+        // agree.
+        let samples = paddedToWholeFrames(normalizedSamples(audio))
         let dtype = lmHead.weight.dtype
-        let expectedFrames = Int(
-            ceil(Double(samples.size) / Double(config.compressionRatio)))
+        let expectedFrames = samples.size / config.compressionRatio
 
-        var acoustic = encodeSegmented(samples.asType(dtype), encoder: acousticEncoder)
-        let semantic = encodeSegmented(samples.asType(dtype), encoder: semanticEncoder)
+        var acoustic = acousticLatents(samples)
+        let semantic = encodeSegmented(
+            samples.asType(audioEncoderDType), encoder: semanticEncoder)
 
         // Only the acoustic branch is a distribution; upstream takes the semantic one's
         // mean unconditionally.
@@ -117,9 +126,10 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
                 acoustic, config: config.acousticTokenizer)
         }
 
-        // NCL -> NLC so the connectors see channel-last features.
-        var acousticFeatures = acousticConnector(swappedAxes(acoustic, 1, 2))
-        var semanticFeatures = semanticConnector(swappedAxes(semantic, 1, 2))
+        // NCL -> NLC so the connectors see channel-last features, back at the LM's
+        // precision since the connectors belong to the language side.
+        var acousticFeatures = acousticConnector(swappedAxes(acoustic, 1, 2).asType(dtype))
+        var semanticFeatures = semanticConnector(swappedAxes(semantic, 1, 2).asType(dtype))
 
         // The prompt reserves exactly ceil(samples / 3200) placeholders, so the feature
         // count has to agree or the splice would misalign.
@@ -128,6 +138,28 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
 
         // The two projections are summed, not concatenated.
         return acousticFeatures + semanticFeatures
+    }
+
+    /// Precision the audio encoders run at, read from their own weights.
+    var audioEncoderDType: DType { acousticEncoder.stem.conv.conv.weight.dtype }
+
+    /// Acoustic latents (NCL) for already-normalised, frame-aligned samples.
+    func acousticLatents(_ samples: MLXArray) -> MLXArray {
+        encodeSegmented(samples.asType(audioEncoderDType), encoder: acousticEncoder)
+    }
+
+    /// Normalises and frame-aligns raw audio, as `encodeAudio` does before encoding.
+    func preparedSamples(_ audio: MLXArray) -> MLXArray {
+        paddedToWholeFrames(normalizedSamples(audio))
+    }
+
+    /// Zero-pads to the next whole 3200-sample frame.
+    private func paddedToWholeFrames(_ samples: MLXArray) -> MLXArray {
+        let ratio = config.compressionRatio
+        let remainder = samples.size % ratio
+        guard remainder != 0 else { return samples }
+        return concatenated(
+            [samples, MLXArray.zeros([ratio - remainder], dtype: samples.dtype)], axis: 0)
     }
 
     /// Applies the -25 dBFS normalisation the non-streaming checkpoints were trained with.
@@ -215,10 +247,9 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         let cache = languageModel.makeCache()
 
         var hidden = languageModel(inputsEmbeds: embeds, cache: cache)
-        var token = nextToken(hidden, parameters: generationParameters)
-
         let eos = tokenizer.eosTokenId ?? 151_643
         var pieces: [Int] = []
+        var token = nextToken(hidden, parameters: generationParameters, generated: pieces)
 
         while generated < generationParameters.maxTokens, token != eos {
             pieces.append(token)
@@ -226,9 +257,11 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
             onToken(tokenizer.decode(tokens: [token]))
             onTokenID?(token)
 
+            if Self.isDegenerate(pieces, parameters: generationParameters) { break }
+
             let ids = MLXArray([Int32(token)], [1, 1])
             hidden = languageModel(inputsEmbeds: languageModel.embed(ids), cache: cache)
-            token = nextToken(hidden, parameters: generationParameters)
+            token = nextToken(hidden, parameters: generationParameters, generated: pieces)
 
             if generated % 50 == 0 { Memory.clearCache() }
         }
@@ -296,19 +329,73 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         return (embeds, prefix.count + frames + suffix.count)
     }
 
-    private func nextToken(_ hidden: MLXArray, parameters: STTGenerateParameters) -> Int {
-        let logits = lmHead(hidden[0..., -1, 0...])
+    func nextToken(
+        _ hidden: MLXArray,
+        parameters: STTGenerateParameters,
+        generated: [Int]
+    ) -> Int {
+        var logits = lmHead(hidden[0..., -1, 0...])
+        if parameters.temperature > 0 { logits = logits / parameters.temperature }
+        logits = Self.applyRepetitionPenalty(
+            logits, generated: generated,
+            penalty: parameters.repetitionPenalty,
+            contextSize: parameters.repetitionContextSize)
+
         if parameters.temperature <= 0 {
             return MLX.argMax(logits, axis: -1).item(Int.self)
         }
-        let scaled = logits / parameters.temperature
-        return MLXRandom.categorical(scaled).item(Int.self)
+        return MLXRandom.categorical(logits).item(Int.self)
+    }
+
+    /// Sign-aware repetition penalty, matching the mlx-lm convention already used by
+    /// Qwen3-ASR in this package: recently emitted tokens are pushed toward zero, so a
+    /// greedy decode can climb out of a loop.
+    static func applyRepetitionPenalty(
+        _ logits: MLXArray,
+        generated: [Int],
+        penalty: Float,
+        contextSize: Int
+    ) -> MLXArray {
+        guard penalty != 1.0, !generated.isEmpty else { return logits }
+        let recent = MLXArray(Array(generated.suffix(Swift.max(1, contextSize))).map { Int32($0) })
+        let selected = logits[0..., recent]
+        let scale = MLXArray(penalty)
+        let out = logits
+        out[0..., recent] = MLX.where(selected .> 0, selected / scale, selected * scale)
+        return out
+    }
+
+    /// Backstop for greedy callers, which have no penalty to escape a loop with.
+    ///
+    /// Long or difficult audio can collapse into repeating one phrase forever — a two-hour
+    /// lecture produced "I mean, I mean, I mean…" until it hit the token cap. Left alone
+    /// that grows the KV cache for nothing and stalls for minutes, so a run of almost no
+    /// distinct tokens ends generation. Skipped when the caller supplies a penalty, since
+    /// that is the real fix and genuinely repetitive speech should not be truncated.
+    static func isDegenerate(_ generated: [Int], parameters: STTGenerateParameters) -> Bool {
+        guard parameters.repetitionPenalty == 1.0, generated.count >= 24 else { return false }
+        return Set(generated.suffix(24)).count <= 3
     }
 
     // MARK: - Loading
 
+    /// Precision to run the language model at.
+    ///
+    /// The checkpoint is bfloat16 and that is fine for short clips, but greedy decoding
+    /// degenerates into a repetition loop on longer audio: on a lecture recording it holds
+    /// up to about two minutes and collapses by three, where float32 transcribes the same
+    /// audio cleanly and matches the reference word for word. float32 doubles the weights
+    /// to roughly 33 GB.
+    public enum Precision: String, Sendable {
+        /// The checkpoint's own precision. Fast and compact; use for short audio.
+        case bfloat16
+        /// Matches the reference implementation. Needed for long recordings.
+        case float32
+    }
+
     public static func fromPretrained(
         _ modelRepo: String,
+        precision: Precision = .bfloat16,
         cache: HubCache = .default
     ) async throws -> VibeVoiceASRModel {
         guard let repoID = Repo.ID(rawValue: modelRepo) else {
@@ -321,10 +408,13 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
                 "*.json", "tokenizer*", "vocab*", "merges*", "special_tokens*", "*.jinja",
             ],
             cache: cache)
-        return try await fromModelDirectory(dir)
+        return try await fromModelDirectory(dir, precision: precision)
     }
 
-    public static func fromModelDirectory(_ modelDir: URL) async throws -> VibeVoiceASRModel {
+    public static func fromModelDirectory(
+        _ modelDir: URL,
+        precision: Precision = .bfloat16
+    ) async throws -> VibeVoiceASRModel {
         let configURL = modelDir.appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else {
             throw VibeVoiceASRError.missingConfig(modelDir)
@@ -371,6 +461,24 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
             parameters: ModuleParameters.unflattened(
                 sanitize(weights: weights, layout: config.layout)),
             verify: .all)
+
+        // Keep the audio encoders in float32 even though the checkpoint is bfloat16.
+        //
+        // They are ~33 convolutions deep, and bf16 accumulates through them badly: measured
+        // against the reference on a 3 minute clip, the latents come out at 40.7 dB SNR in
+        // bf16 against 68.2 dB in float32. That degradation is enough to send greedy
+        // decoding into a repetition loop on long audio. The two encoders are a small part
+        // of an 8B model, so this costs about a gigabyte and leaves the language model at
+        // its native precision.
+        model.acousticEncoder.update(
+            parameters: model.acousticEncoder.parameters().mapValues { $0.asType(.float32) })
+        model.semanticEncoder.update(
+            parameters: model.semanticEncoder.parameters().mapValues { $0.asType(.float32) })
+
+        if precision == .float32 {
+            model.update(parameters: model.parameters().mapValues { $0.asType(.float32) })
+        }
+
         model.train(false)
         eval(model)
         return model
