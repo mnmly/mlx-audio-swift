@@ -84,8 +84,15 @@ struct VibeVoiceASRParityTests {
         #expect(snr > 30)
     }
 
-    /// Greedy decoding is deterministic, so with the same prompt, the same features and the
-    /// reference's VAE sampling disabled, the token stream should match.
+    /// Greedy decoding against the reference.
+    ///
+    /// Two different assertions, because the model's output mixes two kinds of content.
+    /// The JSON scaffolding is discrete and must match token for token. The timestamps are
+    /// continuous values predicted *as text*, so the ~1e-3 latent difference MLX's Metal
+    /// kernels leave behind is enough to flip a digit — on 90 s of audio the second
+    /// timestamp comes out `6.49` against the reference's `6.52`. Demanding an exact token
+    /// stream there would be asserting that two float pipelines agree bit for bit. What has
+    /// to match is the transcribed *words*.
     @Test func greedyDecodeMatchesReference() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let modelDir = env["MLXAUDIO_VIBEVOICE_ASR_DIR"],
@@ -102,18 +109,105 @@ struct VibeVoiceASRParityTests {
         eval(model)
 
         var produced: [Int] = []
-        _ = model.transcribe(
+        let output = model.transcribe(
             audio: audio,
-            generationParameters: STTGenerateParameters(maxTokens: 64, temperature: 0),
+            generationParameters: STTGenerateParameters(maxTokens: 2048, temperature: 0),
             onToken: { _ in },
             onTokenID: { produced.append($0) })
 
-        let compared = Swift.min(produced.count, Swift.min(referenceIDs.count, 64))
-        let matching = zip(produced.prefix(compared), referenceIDs.prefix(compared))
+        // The opening is `<|im_start|>assistant\n[{"Start"` — discrete structure that
+        // depends on the prompt, the spliced features and the decode loop all being right.
+        let prefix = 8
+        let matchingPrefix = zip(produced.prefix(prefix), referenceIDs.prefix(prefix))
             .prefix { $0 == $1 }.count
-        print("VibeVoice ASR parity: first \(matching)/\(compared) generated ids match; "
-            + "swift \(produced.prefix(8)) vs reference \(referenceIDs.prefix(8))")
+        print("VibeVoice ASR parity: structural prefix \(matchingPrefix)/\(prefix) ids match")
+        #expect(matchingPrefix == prefix)
 
-        #expect(matching == compared)
+        let referenceText = model.tokenizer.decode(tokens: referenceIDs)
+        let referenceSegments = VibeVoiceASRPrompt.parse(referenceText)
+        let producedSegments = VibeVoiceASRPrompt.parse(model.tokenizer.decode(tokens: produced))
+
+        let referenceWords = referenceSegments.compactMap(\.text).joined(separator: " ")
+        let producedWords = producedSegments.compactMap(\.text).joined(separator: " ")
+
+        print("""
+            VibeVoice ASR parity: \(producedSegments.count) segments vs \
+            \(referenceSegments.count) reference
+              swift     \(producedWords.prefix(90).debugDescription)
+              reference \(referenceWords.prefix(90).debugDescription)
+            """)
+
+        #expect(!referenceSegments.isEmpty)
+        #expect(producedSegments.count == referenceSegments.count)
+        #expect(producedWords == referenceWords)
+        #expect(!output.text.isEmpty)
+    }
+}
+
+/// Exercises the real-time streaming path, which needs its own checkpoint
+/// (`microsoft/VibeVoice-ASR-Streaming-7B`) and the nested weight layout.
+///
+/// ```
+/// TEST_RUNNER_MLXAUDIO_VIBEVOICE_ASR_STREAMING_DIR=/path/to/VibeVoice-ASR-Streaming-7B \
+/// TEST_RUNNER_MLXAUDIO_VIBEVOICE_ASR_AUDIO=/path/to/audio.wav \
+/// xcodebuild test-without-building -scheme MLXAudio-Package -destination 'platform=macOS' \
+///   -only-testing:'MLXAudioTests/VibeVoiceASRStreamingTests'
+/// ```
+@Suite("VibeVoice ASR streaming", .serialized)
+struct VibeVoiceASRStreamingTests {
+
+    @Test func transcribesIncrementally() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let modelDir = env["MLXAUDIO_VIBEVOICE_ASR_STREAMING_DIR"],
+            let audioPath = env["MLXAUDIO_VIBEVOICE_ASR_AUDIO"]
+        else {
+            print("Skipping VibeVoice ASR streaming test; set "
+                + "MLXAUDIO_VIBEVOICE_ASR_STREAMING_DIR and MLXAUDIO_VIBEVOICE_ASR_AUDIO.")
+            return
+        }
+
+        let fixture = try MLX.loadArrays(url: URL(fileURLWithPath: audioPath))
+        let audio = try #require(fixture["audio"]).asType(.float32)
+
+        let model = try await VibeVoiceASRModel.fromModelDirectory(
+            URL(fileURLWithPath: modelDir))
+
+        // This checkpoint is the nested layout, so loading it at all exercises that mapping.
+        #expect(model.config.layout == .nested)
+        // And it declares its own geometry, which must override the defaults.
+        #expect(model.streamingChunkFrames == 22)
+        #expect(model.streamingLookaheadFrames == 4)
+        // The streaming checkpoint is trained on un-normalised audio.
+        #expect(model.normalizeAudio == false)
+
+        let session = VibeVoiceASRStreamSession(model: model)
+        #expect(session.chunkSamples == 22 * 3200)
+        #expect(session.lookaheadSamples == 4 * 3200)
+
+        // Feed the audio the way a microphone would: in small, uneven pieces.
+        let samples = audio.asArray(Float.self)
+        var chunks: [VibeVoiceASRStreamSession.Chunk] = []
+        var offset = 0
+        let feed = 24000  // one second at a time
+        while offset < samples.count {
+            let end = Swift.min(offset + feed, samples.count)
+            chunks.append(contentsOf: session.append(MLXArray(Array(samples[offset ..< end]))))
+            offset = end
+        }
+        chunks.append(contentsOf: session.finish())
+
+        let transcript = chunks.map(\.text).joined(separator: " ")
+        print("""
+            VibeVoice ASR streaming: \(chunks.count) chunks over \
+            \(String(format: "%.1f", Double(samples.count) / 24000))s
+              \(transcript.prefix(300).debugDescription)
+            """)
+
+        // Chunks must advance by the trained stride, and cover the audio.
+        let expectedChunks = Int(
+            ceil(Double(samples.count) / Double(session.chunkSamples)))
+        #expect(chunks.count == expectedChunks)
+        #expect(zip(chunks, chunks.dropFirst()).allSatisfy { $0.startTime < $1.startTime })
+        #expect(!transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 }

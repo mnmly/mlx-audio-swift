@@ -44,8 +44,17 @@ two environment variables. Set `vae_std = 0` on the reference first — the acou
 samples at inference, so without that its own latents differ run to run by ~2.6% and the
 comparison measures noise rather than correctness.
 
-With sampling disabled the acoustic latents match at **66 dB SNR, correlation 1.0**, and
-greedy decoding reproduces the reference's token stream **exactly** in float32.
+With sampling disabled the acoustic latents match at **66 dB SNR, correlation 1.0** — both
+for a 30 s clip and for a 90 s one, which crosses the 60 s segmentation threshold and comes
+out at the expected 675 frames.
+
+Two different assertions cover decoding, because the output mixes two kinds of content. The
+JSON scaffolding is discrete and matches the reference token for token. The timestamps are
+continuous values predicted *as text*, so the ~1e-3 difference MLX's Metal kernels leave in
+the latents is enough to flip a digit — over 90 s the second timestamp comes out `6.49`
+against the reference's `6.52`. Requiring an exact token stream there would be asserting
+that two float pipelines agree bit for bit, so what is checked is the transcribed *words*,
+which match exactly (30 segments on both sides).
 
 ## Checkpoints
 
@@ -83,4 +92,10 @@ Each window is `chunk_frames` of advance plus `lookahead_frames` of future conte
 and 0.53 s for the shipped checkpoint), decoded until the model emits `<|text_chunk_end|>`.
 That separator is then appended to the cache **whether or not the model produced it**, which
 is what keeps successive chunks aligned. A checkpoint only works at the geometry it was
-trained on, so both values are read from its `preprocessor_config.json`.
+trained on, so both values are read from its `preprocessor_config.json` — which is also
+where `normalize_audio: false` comes from, since the streaming model is trained on
+un-normalised audio.
+
+Verified against `microsoft/VibeVoice-ASR-Streaming-7B`: feeding 30 s of audio one second at
+a time yields 11 chunks (30 / 2.93) of coherent, speaker-labelled text. That checkpoint uses
+the nested weight layout, so it exercises that mapping end to end.
