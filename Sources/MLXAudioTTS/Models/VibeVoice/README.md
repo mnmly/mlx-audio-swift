@@ -7,14 +7,14 @@ tokens with six acoustic latents, decoding each latent to 24 kHz audio as soon a
 sampled.
 
 ```swift
-let model = try await TTS.loadModel(modelRepo: "mlx-community/VibeVoice-Realtime-0.5B")
+let model = try await TTS.loadModel(modelRepo: "mnmly/VibeVoice-Realtime-0.5B-mlx")
 for try await event in model.generateStream(text: "Hello there.", voice: "en-Carter_man") {
     if case .audio(let chunk) = event { player.enqueue(chunk) }
 }
 ```
 
 ```
-swift run mlx-audio-swift-tts --model mlx-community/VibeVoice-Realtime-0.5B \
+swift run mlx-audio-swift-tts --model mnmly/VibeVoice-Realtime-0.5B-mlx \
     --voice en-Carter_man --benchmark "Hello there."
 ```
 
@@ -47,8 +47,13 @@ conversation state: a `last_hidden_state` plus a KV cache for each of the `lm`, 
 the negative branch is only ever fed speech embeddings, so it never reaches the text-only
 stack.)
 
-Upstream distributes these as `.pt` pickles in `demo/voices/streaming_model/`. Convert them
-to safetensors and place them in `voices/` next to the weights:
+[mnmly/VibeVoice-Realtime-0.5B-mlx](https://huggingface.co/mnmly/VibeVoice-Realtime-0.5B-mlx)
+packages all of this — the upstream weights (byte-identical), the 25 converted voices, and
+the Qwen2.5-0.5B tokenizer — so `fromPretrained` works in one step.
+
+To rebuild it yourself: upstream distributes the voices as `.pt` pickles in
+`demo/voices/streaming_model/`. Convert them to safetensors and place them in `voices/`
+next to the weights:
 
 ```python
 # flatten each branch to <branch>.last_hidden_state / <branch>.key.<layer> / <branch>.value.<layer>
