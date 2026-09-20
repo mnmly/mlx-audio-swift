@@ -56,6 +56,8 @@ private struct Segment {
     let text: String
     let start: Double
     let end: Double
+    /// Set by diarizing models; nil for everything else.
+    let speaker: String?
 }
 
 private enum LoadedModel {
@@ -507,13 +509,16 @@ enum App {
             let url = outputURL(stem: outputPathStem, ext: "json")
             let jsonObject: [String: Any] = [
                 "text": output.text,
-                "segments": (segments ?? []).map {
-                    [
-                        "text": $0.text,
-                        "start": $0.start,
-                        "end": $0.end,
-                        "duration": $0.end - $0.start,
+                "segments": (segments ?? []).map { segment -> [String: Any] in
+                    var item: [String: Any] = [
+                        "text": segment.text,
+                        "start": segment.start,
+                        "end": segment.end,
+                        "duration": segment.end - segment.start,
                     ]
+                    // Only diarizing models set this; omitted rather than null otherwise.
+                    if let speaker = segment.speaker { item["speaker_id"] = speaker }
+                    return item
                 },
                 "language": output.language as Any,
                 "prompt_tokens": output.promptTokens,
@@ -541,7 +546,8 @@ enum App {
             else {
                 continue
             }
-            segments.append(Segment(text: text, start: start, end: end))
+            let speaker = item["speaker_id"].map { "\($0)" }
+            segments.append(Segment(text: text, start: start, end: end, speaker: speaker))
         }
 
         return segments.isEmpty ? nil : segments
