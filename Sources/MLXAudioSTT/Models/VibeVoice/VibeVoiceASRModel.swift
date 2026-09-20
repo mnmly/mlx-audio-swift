@@ -153,6 +153,26 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         paddedToWholeFrames(normalizedSamples(audio))
     }
 
+    /// Longest audio this port transcribes reliably at bfloat16, in seconds.
+    ///
+    /// Measured on a lecture recording: clean at two minutes, collapsed into a repetition
+    /// loop by three. PyTorch transcribes the same audio correctly at bfloat16, so this is
+    /// a limitation of this port rather than of the model.
+    static let bfloat16SafeDuration: Double = 120
+
+    private func warnIfPrecisionIsRisky(sampleCount: Int) {
+        let duration = Double(sampleCount) / Double(config.samplingRate)
+        guard lmHead.weight.dtype != .float32, duration > Self.bfloat16SafeDuration else {
+            return
+        }
+        FileHandle.standardError.write(Data("""
+            [mlx-audio] VibeVoice ASR: \(Int(duration))s of audio at bfloat16. Past about \
+            \(Int(Self.bfloat16SafeDuration))s this port degenerates into a repetition loop; \
+            load with precision: .float32 (or --precision float32) for long recordings.
+
+            """.utf8))
+    }
+
     /// Zero-pads to the next whole 3200-sample frame.
     private func paddedToWholeFrames(_ samples: MLXArray) -> MLXArray {
         let ratio = config.compressionRatio
@@ -236,6 +256,7 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         onTokenID: ((Int) -> Void)? = nil
     ) -> STTOutput {
         let start = Date()
+        warnIfPrecisionIsRisky(sampleCount: audio.size)
         let features = encodeAudio(audio)
         let duration = Double(audio.size) / Double(config.samplingRate)
 
