@@ -73,6 +73,8 @@ private struct Options {
     var verbose = false
     var maxTokens = 2048
     var language: String? = nil
+    /// "float32" raises VibeVoice ASR out of its bfloat16 checkpoint precision.
+    var precision: String? = nil
     var chunkDuration: Float = 30.0
     var frameThreshold = 25
     var stream = false
@@ -118,6 +120,9 @@ private struct Options {
             case "--language":
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 options.language = v
+            case "--precision":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                options.precision = v
             case "--chunk-duration":
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 guard let value = Float(v) else { throw CLIError.invalidValue(arg, v) }
@@ -230,6 +235,9 @@ private struct Options {
               --verbose                     Verbose logging
               --max-tokens <int>            Max generated tokens. Default: 2048
               --language <code|name>        Optional language hint. Omit to allow model autodetect when supported
+              --precision <bfloat16|float32> VibeVoice ASR only. Its bfloat16 checkpoint
+                                            degenerates past roughly two minutes of audio;
+                                            float32 fixes that, at ~33 GB of weights.
               --chunk-duration <float>      Chunk duration seconds. Default: 30.0
               --frame-threshold <int>       Accepted for compatibility (currently unused). Default: 25
               --stream                      Stream token output while generating
@@ -268,7 +276,7 @@ enum App {
             throw AppError.inputFileNotFound(inputURL.path)
         }
 
-        let model = try await loadModel(repo: options.model)
+        let model = try await loadModel(repo: options.model, precision: options.precision)
         let (inputSampleRate, inputAudio) = try loadAudioArray(from: inputURL)
         // Ask the model: feeding a 24 kHz model at 16 kHz still decodes, but slurs the
         // audio by 1.5x and misreports its duration in the prompt.
@@ -453,11 +461,23 @@ enum App {
         return output
     }
 
-    private static func loadModel(repo: String) async throws -> LoadedModel {
+    private static func loadModel(repo: String, precision: String?) async throws -> LoadedModel {
         let lower = repo.lowercased()
 
         if lower.contains("forcedalign") || lower.contains("forced-align") {
             return .forcedAligner(try await Qwen3ForcedAlignerModel.fromPretrained(repo))
+        }
+
+        // Only VibeVoice ASR has a precision to choose; its bfloat16 checkpoint degenerates
+        // on long audio, so float32 has to be reachable from here.
+        if let precision, lower.contains("vibevoice") {
+            guard let choice = VibeVoiceASRModel.Precision(rawValue: precision) else {
+                throw CLIError.invalidValue("--precision", precision)
+            }
+            return .stt(try await VibeVoiceASRModel.fromPretrained(repo, precision: choice))
+        }
+        if precision != nil {
+            fputs("[WARNING] --precision is only honoured by VibeVoice ASR; ignoring.\n", stderr)
         }
         return .stt(try await STT.loadModel(modelRepo: repo))
     }
