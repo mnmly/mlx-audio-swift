@@ -15,9 +15,13 @@ public final class VibeVoiceTokenizerEncoder: Module {
 
     private let depths: [Int]
 
+    /// Latent channels the encoder emits.
+    public let outputChannels: Int
+
     public init(config: VibeVoiceTokenizerConfiguration, dimension: Int) {
         let padMode = config.mlxPadMode
         let ratios = Array(config.encoderRatios.reversed())
+        self.outputChannels = dimension
         let depths = config.parsedEncoderDepths
         self.depths = depths
 

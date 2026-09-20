@@ -49,6 +49,8 @@ public enum STT {
         }
 
         switch resolved {
+        case "vibevoice_asr", "vibevoice":
+            return try await VibeVoiceASRModel.fromPretrained(modelRepo, cache: cache)
         case "moss_transcribe_diarize":
             return try await MossTranscribeDiarizeModel.fromPretrained(modelRepo, cache: cache)
         case "qwen3_asr":
@@ -91,8 +93,12 @@ public enum STT {
         return trimmed.lowercased()
     }
 
-    private static func inferModelType(from modelRepo: String) -> String? {
+    static func inferModelType(from modelRepo: String) -> String? {
         let lower = modelRepo.lowercased()
+        // Must precede the generic qwen match: the backbone is a Qwen2.5-7B.
+        if lower.contains("vibevoice") {
+            return "vibevoice_asr"
+        }
         if lower.contains("moss-transcribe-diarize") || lower.contains("moss_transcribe_diarize") {
             return "moss_transcribe_diarize"
         }

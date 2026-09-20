@@ -52,6 +52,9 @@ public struct STTGenerateParameters: Sendable {
 public protocol STTGenerationModel: AnyObject {
     var defaultGenerationParameters: STTGenerateParameters { get }
 
+    /// Sample rate, in Hz, that `generate(audio:)` expects its input at.
+    var sampleRate: Int { get }
+
     func generate(
         audio: MLXArray,
         generationParameters: STTGenerateParameters
@@ -64,6 +67,10 @@ public protocol STTGenerationModel: AnyObject {
 }
 
 public extension STTGenerationModel {
+    /// Nearly every speech recognizer here is 16 kHz; VibeVoice ASR, at 24 kHz, is the
+    /// exception, so the requirement is defaulted rather than forced on every model.
+    var sampleRate: Int { 16000 }
+
     func generate(
         audio: MLXArray,
         generationParameters: STTGenerateParameters? = nil

@@ -268,7 +268,14 @@ enum App {
 
         let model = try await loadModel(repo: options.model)
         let (inputSampleRate, inputAudio) = try loadAudioArray(from: inputURL)
-        let audio = try prepareAudioForSTT(inputAudio, inputSampleRate: inputSampleRate, targetSampleRate: 16000)
+        // Ask the model: feeding a 24 kHz model at 16 kHz still decodes, but slurs the
+        // audio by 1.5x and misreports its duration in the prompt.
+        let targetSampleRate: Int = {
+            if case .stt(let sttModel) = model { return sttModel.sampleRate }
+            return 16000
+        }()
+        let audio = try prepareAudioForSTT(
+            inputAudio, inputSampleRate: inputSampleRate, targetSampleRate: targetSampleRate)
 
         let startTime = CFAbsoluteTimeGetCurrent()
 
@@ -277,8 +284,8 @@ enum App {
             print("Audio path: \(inputURL.path)")
             print("Output path: \(options.outputPath!).\(options.format.rawValue)")
             print("Format: \(options.format.rawValue)")
-            if inputSampleRate != 16000 {
-                print("Resampled audio: \(inputSampleRate) Hz -> 16000 Hz")
+            if inputSampleRate != targetSampleRate {
+                print("Resampled audio: \(inputSampleRate) Hz -> \(targetSampleRate) Hz")
             }
             if options.frameThreshold != 25 {
                 print("Warning: --frame-threshold is currently ignored by this CLI.")
