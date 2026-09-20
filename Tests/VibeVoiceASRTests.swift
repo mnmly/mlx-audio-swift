@@ -278,6 +278,43 @@ struct VibeVoiceASRTests {
         #expect(segments[0].startTime == 1.0)
     }
 
+
+    // MARK: - VAE sampling
+
+    /// `sampleAcousticLatents` has to actually change the latents. It was previously
+    /// declared and documented but never read, which is invisible without a test like this:
+    /// the model still transcribes correctly either way.
+    @Test func acousticSamplingIsWiredUp() throws {
+        let config = try JSONDecoder().decode(
+            VibeVoiceTokenizerConfiguration.self,
+            from: Data(#"{"vae_dim": 4, "fix_std": 0.5, "std_dist_type": "gaussian"}"#.utf8))
+
+        let mean = MLXArray([Float](repeating: 1, count: 2 * 4 * 3), [2, 4, 3])
+
+        MLXRandom.seed(0)
+        let drawn = VibeVoiceAcousticTokenizer.sample(mean, config: config)
+        #expect(drawn.shape == mean.shape)
+        // A draw must differ from the mean it was drawn around.
+        #expect(MLX.max(MLX.abs(drawn - mean)).item(Float.self) > 0)
+
+        // One scale per batch element, broadcast over the rest: within a batch row the
+        // deviation is a single scale times standard noise, so two rows should differ.
+        MLXRandom.seed(1)
+        let second = VibeVoiceAcousticTokenizer.sample(mean, config: config)
+        #expect(MLX.max(MLX.abs(second - drawn)).item(Float.self) > 0)
+    }
+
+    /// With `fix_std` 0 the draw collapses to the mean, which is what the deterministic
+    /// default relies on being equivalent to.
+    @Test func zeroScaleSamplingReturnsTheMean() throws {
+        let config = try JSONDecoder().decode(
+            VibeVoiceTokenizerConfiguration.self,
+            from: Data(#"{"vae_dim": 4, "fix_std": 0.0, "std_dist_type": "gaussian"}"#.utf8))
+        let mean = MLXArray([Float](repeating: 2, count: 8), [1, 4, 2])
+        let drawn = VibeVoiceAcousticTokenizer.sample(mean, config: config)
+        #expect(MLX.max(MLX.abs(drawn - mean)).item(Float.self) == 0)
+    }
+
     // MARK: - Registration
 
     @Test func modelTypeResolution() {
