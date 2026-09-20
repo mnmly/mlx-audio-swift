@@ -175,6 +175,54 @@ struct TTSSmokeTests {
         #expect((samples.map { abs($0) }.max() ?? 0) > 0.01)
     }
 
+
+    @Test func vibeVoiceRealtimeGeneratesAudio() async throws {
+        testHeader("vibeVoiceRealtimeGeneratesAudio")
+        defer { testCleanup("vibeVoiceRealtimeGeneratesAudio") }
+        let model = try await TTS.loadModel(modelRepo: "mnmly/VibeVoice-Realtime-0.5B-mlx")
+        #expect(model is VibeVoiceModel)
+        #expect(model.sampleRate == 24000)
+
+        MLXRandom.seed(0)
+        let audio = try await model.generate(
+            text: "Hello world, this is a test.", voice: "en-Carter_man",
+            refAudio: nil, refText: nil, language: nil,
+            generationParameters: GenerateParameters(maxTokens: 300))
+        eval(audio)
+
+        let samples = audio.asType(.float32).asArray(Float.self)
+        // Audio arrives in whole 7.5 Hz latents, so the length is a multiple of 3200.
+        #expect(samples.count % 3200 == 0)
+        #expect(samples.count > 4000)
+        #expect(samples.allSatisfy { $0.isFinite })
+        #expect((samples.map { abs($0) }.max() ?? 0) > 0.01)
+    }
+
+    @Test func vibeVoiceRealtimeGenerateStream() async throws {
+        testHeader("vibeVoiceRealtimeGenerateStream")
+        defer { testCleanup("vibeVoiceRealtimeGenerateStream") }
+        let model = try await TTS.loadModel(modelRepo: "mnmly/VibeVoice-Realtime-0.5B-mlx")
+
+        MLXRandom.seed(0)
+        var chunks = 0
+        var samples = 0
+        for try await event in model.generateStream(
+            text: "Streaming should emit audio before the text runs out.",
+            voice: "en-Emma_woman", refAudio: nil, refText: nil, language: nil,
+            generationParameters: GenerateParameters(maxTokens: 300),
+            streamingInterval: 0.32)
+        {
+            if case .audio(let chunk) = event {
+                chunks += 1
+                samples += chunk.size
+            }
+        }
+
+        // The point of this model: audio comes out in pieces, not one blob at the end.
+        #expect(chunks > 1)
+        #expect(samples > 4000)
+    }
+
     @Test func qwen3Generate() async throws {
         testHeader("qwen3Generate")
         defer { testCleanup("qwen3Generate") }
@@ -635,6 +683,32 @@ struct TTSSmokeTests {
 
 @Suite("STT Smoke Tests", .serialized)
 struct STTSmokeTests {
+
+
+    @Test func vibeVoiceASRTranscribe() async throws {
+        testHeader("vibeVoiceASRTranscribe")
+        defer { testCleanup("vibeVoiceASRTranscribe") }
+        let audioURL = Bundle.module.url(
+            forResource: "multi_speaker", withExtension: "wav", subdirectory: "media")!
+        let (sampleRate, audioData) = try loadAudioArray(from: audioURL)
+
+        let model = try await VibeVoiceASRModel.fromPretrained("microsoft/VibeVoice-ASR-HF")
+        // Both tokenizers are 24 kHz, unlike the 16 kHz recognizers around it.
+        #expect(model.sampleRate == 24000)
+        let audio = sampleRate == model.sampleRate
+            ? audioData
+            : try resampleAudio(audioData, from: sampleRate, to: model.sampleRate)
+
+        let output = model.generate(audio: audio)
+        print("\u{001B}[32m VibeVoice ASR: \(output.text)\u{001B}[0m")
+
+        #expect(!output.text.isEmpty, "Transcription text should not be empty")
+        #expect(output.generationTokens > 0)
+        // This clip has two speakers, so diarization should come back populated.
+        let segments = output.segments ?? []
+        #expect(segments.count > 1)
+        #expect(segments.contains { $0["speaker_id"] != nil })
+    }
 
     @Test func qwen3ASRTranscribe() async throws {
         testHeader("qwen3ASRTranscribe")

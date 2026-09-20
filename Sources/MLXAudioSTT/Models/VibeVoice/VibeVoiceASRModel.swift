@@ -55,7 +55,8 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
     ///
     /// Upstream samples at inference (two `randn` draws per encode), which makes transcripts
     /// non-deterministic for no accuracy gain; its own vLLM plugin exposes `VIBEVOICE_USE_MEAN`
-    /// to turn that off. Off by default here for the same reason.
+    /// to turn that off. Off by default here for the same reason — turn it on only to
+    /// reproduce the reference's exact behaviour.
     public var sampleAcousticLatents = false
 
     /// Window geometry for `VibeVoiceASRStreamSession`, in 7.5 Hz frames.
@@ -106,8 +107,15 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         let expectedFrames = Int(
             ceil(Double(samples.size) / Double(config.compressionRatio)))
 
-        let acoustic = encodeSegmented(samples.asType(dtype), encoder: acousticEncoder)
+        var acoustic = encodeSegmented(samples.asType(dtype), encoder: acousticEncoder)
         let semantic = encodeSegmented(samples.asType(dtype), encoder: semanticEncoder)
+
+        // Only the acoustic branch is a distribution; upstream takes the semantic one's
+        // mean unconditionally.
+        if sampleAcousticLatents {
+            acoustic = VibeVoiceAcousticTokenizer.sample(
+                acoustic, config: config.acousticTokenizer)
+        }
 
         // NCL -> NLC so the connectors see channel-last features.
         var acousticFeatures = acousticConnector(swappedAxes(acoustic, 1, 2))

@@ -74,6 +74,20 @@ public final class VibeVoiceAcousticTokenizer: Module, AudioCodecModel {
     /// With `std_dist_type == "gaussian"` the scale is itself random, one draw per batch
     /// element: `std = randn(B) * (fix_std / 0.8)`, then `mean + std * randn_like(mean)`.
     public func sample(_ mean: MLXArray, scale: Float? = nil) -> MLXArray {
+        Self.sample(mean, config: config, scale: scale)
+    }
+
+    /// Draws from the encoder distribution for a given tokenizer configuration.
+    ///
+    /// Static so callers that hold a bare `VibeVoiceTokenizerEncoder` — ASR builds the two
+    /// encoders directly, since neither checkpoint carries a decoder for them — can sample
+    /// without constructing a full tokenizer. The draw is shape-agnostic: one scale per
+    /// batch element, broadcast across every remaining axis, so it works on NCL or NLC.
+    public static func sample(
+        _ mean: MLXArray,
+        config: VibeVoiceTokenizerConfiguration,
+        scale: Float? = nil
+    ) -> MLXArray {
         let fixStd = scale ?? config.fixStd
         switch config.stdDistType {
         case "gaussian":
