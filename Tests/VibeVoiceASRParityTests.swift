@@ -2,6 +2,7 @@ import Foundation
 @preconcurrency import MLX
 import Testing
 
+import MLXAudioCore
 @testable import MLXAudioSTT
 
 /// Compares the Swift ASR port against the PyTorch reference on real weights.
@@ -39,16 +40,20 @@ struct VibeVoiceASRParityTests {
 
         let model = try await VibeVoiceASRModel.fromModelDirectory(
             URL(fileURLWithPath: modelDir))
-        // The reference ran in float32; bf16 would swamp the comparison.
-        model.update(parameters: model.parameters().mapValues { $0.asType(.float32) })
-        eval(model)
+        // The reference ran in float32. Set MLXAUDIO_VIBEVOICE_KEEP_BF16 to measure the
+        // checkpoint's native precision instead, which is what the CLI actually runs.
+        if env["MLXAUDIO_VIBEVOICE_KEEP_BF16"] == nil {
+            model.update(parameters: model.parameters().mapValues { $0.asType(.float32) })
+            eval(model)
+        }
 
         let frames = Int(ceil(Double(audio.size) / Double(model.config.compressionRatio)))
         #expect(expected.dim(0) == frames)
 
-        let normalized = model.normalizedSamples(audio)
-        let latents = swappedAxes(
-            model.acousticEncoder(normalized.reshaped([1, 1, normalized.size])), 1, 2)
+        // Goes through the same preparation `encodeAudio` uses, so this measures the real
+        // path rather than a shortcut around it.
+        let prepared = model.preparedSamples(audio)
+        let latents = swappedAxes(model.acousticLatents(prepared), 1, 2)
         let produced = latents.reshaped([-1, latents.dim(2)])
 
         print("VibeVoice ASR parity: latents \(produced.shape) vs reference \(expected.shape)")
@@ -77,6 +82,30 @@ struct VibeVoiceASRParityTests {
             relative \(diff / Swift.max(scale, 1e-9)), SNR \(String(format: "%.1f", snr)) dB, \
             correlation \(correlation)
             """)
+
+        // Where the error sits matters: concentrated at a multiple of the 450-frame
+        // segmentation boundary would mean the chunked encode is wrong, whereas spread
+        // evenly is just accumulated kernel noise.
+        let perFrameError = MLX.max(MLX.abs(produced - expected), axis: 1)
+        let worstFrame = MLX.argMax(perFrameError, axis: 0).item(Int.self)
+        let framesPerSegment = 1_440_000 / 3200
+        print("""
+            VibeVoice ASR parity: worst frame \(worstFrame) of \(produced.dim(0)) \
+            (segment boundary every \(framesPerSegment) frames, \
+            distance to nearest boundary \
+            \(Swift.min(worstFrame % framesPerSegment, framesPerSegment - worstFrame % framesPerSegment)))
+            """)
+
+        // The final frame can cover only a handful of real samples when the audio length
+        // is not a multiple of the 3200-sample hop; measure it separately from the rest.
+        if produced.dim(0) > 1 {
+            let head = produced[0 ..< (produced.dim(0) - 1), 0...]
+            let headRef = expected[0 ..< (expected.dim(0) - 1), 0...]
+            let e = MLX.sqrt(MLX.mean((head - headRef) * (head - headRef))).item(Float.self)
+            let sig = MLX.sqrt(MLX.mean(headRef * headRef)).item(Float.self)
+            print("VibeVoice ASR parity: excluding the final frame, SNR "
+                + String(format: "%.1f", 20 * log10(sig / Swift.max(e, 1e-20))) + " dB")
+        }
 
         // Deep convolution stacks accumulate MLX's reduced-precision Metal kernels, so this
         // is bounded on error energy rather than a single worst sample.
@@ -209,5 +238,62 @@ struct VibeVoiceASRStreamingTests {
         #expect(chunks.count == expectedChunks)
         #expect(zip(chunks, chunks.dropFirst()).allSatisfy { $0.startTime < $1.startTime })
         #expect(!transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+}
+
+/// Guards the failure mode that long audio exposed: greedy decoding collapsing into a
+/// repeated phrase instead of transcribing.
+///
+/// ```
+/// TEST_RUNNER_MLXAUDIO_VIBEVOICE_ASR_DIR=/path/to/VibeVoice-ASR-HF \
+/// TEST_RUNNER_MLXAUDIO_VIBEVOICE_ASR_WAV=/path/to/long.wav \
+/// xcodebuild test-without-building -scheme MLXAudio-Package -destination 'platform=macOS' \
+///   -only-testing:'MLXAudioTests/VibeVoiceASRLongAudioTests'
+/// ```
+@Suite("VibeVoice ASR long audio", .serialized)
+struct VibeVoiceASRLongAudioTests {
+
+    @Test func longAudioTranscribesWithoutDegenerating() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let modelDir = env["MLXAUDIO_VIBEVOICE_ASR_DIR"],
+            let wavPath = env["MLXAUDIO_VIBEVOICE_ASR_WAV"]
+        else {
+            print("Skipping VibeVoice ASR long-audio test; set MLXAUDIO_VIBEVOICE_ASR_DIR "
+                + "and MLXAUDIO_VIBEVOICE_ASR_WAV.")
+            return
+        }
+
+        let (sampleRate, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath))
+        let audio = sampleRate == 24000 ? raw : try resampleAudio(raw, from: sampleRate, to: 24000)
+        let duration = Double(audio.size) / 24000
+        #expect(duration > 150, "This test is about audio long enough to trigger the collapse")
+
+        let model = try await VibeVoiceASRModel.fromModelDirectory(
+            URL(fileURLWithPath: modelDir), precision: .float32)
+
+        let output = model.generate(
+            audio: audio,
+            generationParameters: STTGenerateParameters(maxTokens: 8192, temperature: 0))
+
+        let segments = output.segments ?? []
+        print("""
+            VibeVoice ASR long audio: \(String(format: "%.0f", duration))s -> \
+            \(segments.count) segments, \(output.generationTokens) tokens
+              \(output.text.prefix(120).debugDescription)
+            """)
+
+        // A collapse yields one runaway "segment" of repeated text, or none at all.
+        #expect(segments.count > 3)
+        #expect(output.generationTokens > 100)
+
+        // No sentence should repeat more than a couple of times; the failure looked like
+        // "I mean, I mean, I mean" for thousands of tokens.
+        let sentences = output.text
+            .split(whereSeparator: { ".!?\n".contains($0) })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.count > 8 }
+        let counts = Dictionary(grouping: sentences, by: { $0 }).mapValues(\.count)
+        let worst = counts.max { $0.value < $1.value }
+        #expect((worst?.value ?? 0) <= 3, "Repeated \(worst?.value ?? 0)x: \(worst?.key ?? "")")
     }
 }
