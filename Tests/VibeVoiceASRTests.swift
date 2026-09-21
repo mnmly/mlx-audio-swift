@@ -197,6 +197,27 @@ struct VibeVoiceASRTests {
         #expect(prompt.contains("Please transcribe it with these keys:"))
     }
 
+    /// `parts(...)` is what the model actually calls — `build` is only used by tests and
+    /// the streaming path — so the context hint has to survive this split too. It reached
+    /// `build` but not `parts` at first, which left `--context` silently inert for file
+    /// transcription.
+    @Test func partsCarryContextInfoIntoTheTail() {
+        let plain = VibeVoiceASRPrompt.parts(audioDuration: 3)
+        #expect(!plain.tail.contains("with extra info"))
+        #expect(plain.tail.contains("This is a 3.00 seconds audio, please transcribe it"))
+
+        let hinted = VibeVoiceASRPrompt.parts(audioDuration: 3, contextInfo: "  Galluzzo, Athos  ")
+        #expect(hinted.tail.contains("with extra info: Galluzzo, Athos"))
+        #expect(hinted.head == plain.head, "the hint belongs after the audio span, not before it")
+    }
+
+    /// The hint rides on the shared parameter struct, so a caller that never mentions it
+    /// keeps the unhinted prompt.
+    @Test func generateParametersDefaultToNoContext() {
+        #expect(STTGenerateParameters().contextInfo == nil)
+        #expect(STTGenerateParameters(contextInfo: "Acme").contextInfo == "Acme")
+    }
+
     @Test func streamingPromptIsRawText() {
         let prompt = VibeVoiceASRPrompt.buildStreaming()
         #expect(!prompt.contains("<|im_start|>"))
