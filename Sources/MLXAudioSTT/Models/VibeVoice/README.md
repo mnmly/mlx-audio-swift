@@ -65,7 +65,8 @@ returned garbage. Fixed upstream in MLX 0.32.0 (ml-explore/mlx#3810), which no m
 release bundles yet. The prompt is therefore prefilled in slices whose `M·N` stays under
 2048² (1024 tokens for this hidden size), which never reaches that kernel and, as in mlx-lm,
 also keeps prefill memory flat. `precision: .float32` remains available for comparisons
-against the reference, at twice the memory:
+against the reference, at roughly 1.8× the memory and half the speed
+(see [Performance](#performance)):
 
 ```swift
 let model = try await VibeVoiceASRModel.fromPretrained(
@@ -82,7 +83,46 @@ to escape a loop) generation stops once the last 24 tokens contain almost no dis
 values, rather than spending the whole token budget repeating a phrase.
 
 Generation cost grows with context, so one pass over hours of audio is far slower than
-transcribing it in parts.
+transcribing it in parts. See [Performance](#performance).
+
+## Performance
+
+Measured on an M5 Max / 128 GB transcribing a 2 h 02 m lecture (7,355 s, mono 24 kHz), split
+into 25 five-minute chunks at `--max-tokens 8000`. One run per precision, not an average.
+
+| | `float32` | `bfloat16` |
+|---|---|---|
+| Wall clock, 25 chunks | 36.4 min | **18.4 min** |
+| Model time (Σ `total_time`) | 35.4 min | 17.8 min |
+| Faster than realtime | 3.5× | **6.9×** |
+| Decode | 15.4 tok/s | **32.6 tok/s** |
+| Peak memory | 46.6 GB | **25.8 GB** |
+| Segments returned | 390 | 389 |
+
+The two transcripts agree on **99.46%** of words — 87 differences across ~16,000, mostly
+fillers and proper nouns, with neither precision consistently better on the latter. bfloat16
+is the sensible default; `float32` is for comparing against the reference, and at 46.6 GB it
+needs a 64 GB machine where bfloat16 fits in 32 GB.
+
+**Cost tracks transcript length, not audio length.** An average chunk prefills 2,268 tokens
+and then generates 1,287. At bfloat16 the prefill is 3.3 s of a 42.7 s chunk — 7.7%, with
+decode taking the other 92%; at `float32` decode is ~98% of it. (That run's `prompt_tps` of
+~85,000 is not a real measurement: without the sliced prefill's explicit `eval`, MLX defers
+the work and it lands in the first decode step instead.)
+
+Two consequences:
+
+- Chunking a long recording is not just a memory tactic. Decode slows as the KV cache
+  grows, so per-chunk throughput ranged 10.9–17.1 tok/s at `float32` even across chunks
+  of equal length.
+- **Speeding the audio up does not pay.** Time-compressing with `ffmpeg atempo` removes
+  audio frames from the prompt, which is the part that costs almost nothing, while the
+  transcript stays the same length. Over three chunks, 1.5× ran 1.41× faster for **8.7%
+  WER** against the 1.0× transcript, and 2.0× ran 1.61× faster for **21.8% WER**. Both
+  roughly halved the segment count (70 → 40 → 37), so timestamps and diarization coarsen
+  well before the words do, and proper nouns degrade first — *Galluzzo* → "the Lourdes
+  or", *Unité d'Habitation* → "interpretation". Switching precision buys a larger
+  speedup for a fraction of the error.
 
 ## Verifying against the reference
 
