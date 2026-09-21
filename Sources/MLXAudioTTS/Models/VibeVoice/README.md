@@ -100,6 +100,34 @@ xcodebuild test-without-building -scheme MLXAudio-Package -destination 'platform
 
 With shared noise the two implementations stop on the same frame and track each other at
 about 26 dB SNR overall — 45 dB on the first latent, degrading as each latent feeds back
-into the backbone. The floor is MLX's Metal kernels, which accumulate at roughly bf16
-precision (a 256-wide `matmul` is ~7e-4 relative against PyTorch, `conv1d` ~1e-3, while the
-same calls on the CPU backend agree to ~1e-7).
+into the backbone.
+
+## Why this does not match PyTorch exactly
+
+The floor is **TF32**, not a defect. On hardware with neural accelerators (M5 and later)
+MLX routes float32 matmuls through its NAX kernels, which compute in TF32 — an 8-bit
+exponent with a 10-bit mantissa, so about 5e-4 relative. `mlx/backend/metal/matmul.cpp`
+gates it on `env::enable_tf32()`, which `mlx/utils.h` defaults to on:
+
+```cpp
+static bool enable_tf32_ = get_var("MLX_ENABLE_TF32", 1);
+```
+
+Setting `MLX_ENABLE_TF32=0` restores full float32 — measured on MLX 0.32.2, a
+`512x896 @ 896x896` matmul goes from 8.3e-4 relative against a float64 reference to 8.2e-7 —
+at the cost of the accelerator speedup.
+
+This matters more here than the raw number suggests. The timestep embedder's first `Linear`
+is 256 -> hidden, and its output becomes `c = cond_proj(condition) + t_embedder(t)`, which
+drives the adaLN modulation in *every* head layer; that conditioning then compounds through
+20 chained diffusion steps. Between MLX 0.31.1 and 0.32.2 the NAX routing was broadened
+(ml-explore/mlx#3422, #3419, #3888), so shapes that previously fell back to an exact path —
+this one among them — now reach the accelerators too. The measured effect on this model is a
+uniform 2-4 dB drop across every frame, 26.1 dB SNR against the reference on 0.31.1 versus
+23.5 dB on 0.32.2. Inaudible, but real and reproducible, so the tolerances in
+`Tests/VibeVoiceTTSTests.swift` are calibrated against a stated MLX version rather than
+being version-agnostic: re-derive them from fresh PyTorch golden values when the dependency
+moves, rather than widening the constant until the test passes.
+
+None of this affects VibeVoice **ASR**, which runs bfloat16 — the TF32 flag only governs
+float32 work (`a.dtype() != float32` takes the NAX path regardless).
