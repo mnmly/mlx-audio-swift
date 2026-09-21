@@ -242,7 +242,8 @@ private struct Options {
               --chunk-duration <float>      Chunk duration seconds. Default: 30.0
               --frame-threshold <int>       Accepted for compatibility (currently unused). Default: 25
               --stream                      Stream token output while generating
-              --context <text>              Accepted for compatibility (currently unused)
+              --context <text>              Hint for names, jargon or topics in the audio, to bias
+                                            recognition. Used by VibeVoice ASR; ignored elsewhere
               --prefill-step-size <int>     Accepted for compatibility (currently unused). Default: 2048
               --gen-kwargs <json>           Additional kwargs JSON.
                                             Recognized keys: max_tokens, language, chunk_duration,
@@ -304,9 +305,6 @@ enum App {
             if options.prefillStepSize != 2048 {
                 print("Warning: --prefill-step-size is currently ignored by this CLI.")
             }
-            if options.context?.isEmpty == false {
-                print("Warning: --context is currently ignored by this CLI.")
-            }
         }
 
         let output: STTOutput
@@ -323,7 +321,8 @@ enum App {
                 chunkDuration: options.chunkDuration,
                 minChunkDuration: options.minChunkDuration ?? params.minChunkDuration,
                 repetitionPenalty: options.repetitionPenalty ?? params.repetitionPenalty,
-                repetitionContextSize: options.repetitionContextSize ?? params.repetitionContextSize
+                repetitionContextSize: options.repetitionContextSize ?? params.repetitionContextSize,
+                contextInfo: options.context
             )
 
             if options.stream {

@@ -17,6 +17,10 @@ public struct STTGenerateParameters: Sendable {
     public let kvGroupSize: Int
     /// Cache offset that must be exceeded before the KV cache is quantized.
     public let quantizedKVStart: Int
+    /// Free-text hint biasing recognition toward names, jargon or topics the audio is known
+    /// to contain. Only models whose prompt has somewhere to put it read this; VibeVoice ASR
+    /// calls it `context_info` and appends it to the transcription request.
+    public let contextInfo: String?
 
     public init(
         maxTokens: Int = 8192,
@@ -31,7 +35,8 @@ public struct STTGenerateParameters: Sendable {
         repetitionContextSize: Int = 32,
         kvBits: Int? = nil,
         kvGroupSize: Int = 64,
-        quantizedKVStart: Int = 0
+        quantizedKVStart: Int = 0,
+        contextInfo: String? = nil
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -46,6 +51,7 @@ public struct STTGenerateParameters: Sendable {
         self.kvBits = kvBits
         self.kvGroupSize = kvGroupSize
         self.quantizedKVStart = quantizedKVStart
+        self.contextInfo = contextInfo
     }
 }
 

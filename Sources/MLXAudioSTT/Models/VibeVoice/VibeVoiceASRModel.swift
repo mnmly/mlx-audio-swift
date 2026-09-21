@@ -272,7 +272,9 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         let features = encodeAudio(audio)
         let duration = Double(audio.size) / Double(config.samplingRate)
 
-        let (embeds, promptLength) = buildPromptEmbeddings(features: features, duration: duration)
+        let (embeds, promptLength) = buildPromptEmbeddings(
+            features: features, duration: duration,
+            contextInfo: generationParameters.contextInfo)
 
         var text = ""
         var generated = 0
@@ -350,9 +352,14 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
     /// depends on how its special tokens are configured, and a silent miss here would
     /// misalign every frame. MLX also has no in-place masked assignment, so the sequence is
     /// assembled by concatenation — which is cheap, since the audio span is contiguous.
-    func buildPromptEmbeddings(features: MLXArray, duration: Double) -> (MLXArray, Int) {
+    func buildPromptEmbeddings(
+        features: MLXArray,
+        duration: Double,
+        contextInfo: String? = nil
+    ) -> (MLXArray, Int) {
         let frames = features.dim(1)
-        let (head, tail) = VibeVoiceASRPrompt.parts(audioDuration: duration)
+        let (head, tail) = VibeVoiceASRPrompt.parts(
+            audioDuration: duration, contextInfo: contextInfo)
 
         let headIDs = tokenizer.encode(text: head, addSpecialTokens: false)
         let tailIDs = tokenizer.encode(text: tail, addSpecialTokens: false)
