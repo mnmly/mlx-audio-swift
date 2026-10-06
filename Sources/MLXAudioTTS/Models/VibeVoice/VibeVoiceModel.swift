@@ -134,11 +134,11 @@ public final class VibeVoiceModel: Module, SpeechGenerationModel, @unchecked Sen
     public func generate(
         text: String,
         voice: String?,
-        refAudio: MLXArray?,
+        refAudio: sending MLXArray?,
         refText: String?,
         language: String?,
         generationParameters: GenerateParameters
-    ) async throws -> MLXArray {
+    ) async throws -> sending MLXArray {
         var chunks: [MLXArray] = []
         try runGeneration(
             text: text, voice: voice, generationParameters: generationParameters,
@@ -152,11 +152,11 @@ public final class VibeVoiceModel: Module, SpeechGenerationModel, @unchecked Sen
     public func generateStream(
         text: String,
         voice: String?,
-        refAudio: MLXArray?,
+        refAudio: sending MLXArray?,
         refText: String?,
         language: String?,
         generationParameters: GenerateParameters
-    ) -> AsyncThrowingStream<AudioGeneration, Swift.Error> {
+    ) -> sending AsyncThrowingStream<AudioGeneration, Swift.Error> {
         generateStream(
             text: text, voice: voice, refAudio: refAudio, refText: refText,
             language: language, generationParameters: generationParameters,
@@ -168,12 +168,12 @@ public final class VibeVoiceModel: Module, SpeechGenerationModel, @unchecked Sen
     public func generateStream(
         text: String,
         voice: String?,
-        refAudio: MLXArray?,
+        refAudio: sending MLXArray?,
         refText: String?,
         language: String?,
         generationParameters: GenerateParameters,
         streamingInterval: Double
-    ) -> AsyncThrowingStream<AudioGeneration, Swift.Error> {
+    ) -> sending AsyncThrowingStream<AudioGeneration, Swift.Error> {
         let (stream, continuation) = AsyncThrowingStream<AudioGeneration, Swift.Error>.makeStream()
 
         let framesPerChunk = Swift.max(
@@ -186,19 +186,22 @@ public final class VibeVoiceModel: Module, SpeechGenerationModel, @unchecked Sen
             }
             do {
                 var pending: [MLXArray] = []
+                // The yielded audio leaves this task, so it must not share storage with the
+                // buffer the decoder keeps appending to: copy each emitted chunk out through
+                // host memory into a fresh array (a few thousand samples per chunk).
+                func emit() {
+                    let samples = concatenated(pending, axis: 0).asArray(Float.self)
+                    pending.removeAll(keepingCapacity: true)
+                    continuation.yield(.audio(MLXArray(samples)))
+                }
                 try self.runGeneration(
                     text: text, voice: voice, generationParameters: generationParameters,
                     onAudioChunk: { chunk in
                         pending.append(chunk)
-                        if pending.count >= framesPerChunk {
-                            continuation.yield(.audio(concatenated(pending, axis: 0)))
-                            pending.removeAll(keepingCapacity: true)
-                        }
+                        if pending.count >= framesPerChunk { emit() }
                     },
                     onInfo: { continuation.yield(.info($0)) })
-                if !pending.isEmpty {
-                    continuation.yield(.audio(concatenated(pending, axis: 0)))
-                }
+                if !pending.isEmpty { emit() }
                 continuation.finish()
             } catch {
                 continuation.finish(throwing: error)
