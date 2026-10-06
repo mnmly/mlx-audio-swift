@@ -61,6 +61,12 @@ private func relativeError(_ actual: MLXArray, _ expected: MLXArray) -> Float {
 /// timestep embedder alone is under 1e-3.
 private let gpuRelativeTolerance: Float = 5e-3
 
+/// The reduced precision above is MLX's TF32: on GPUs with NAX matrix units (M5) float32
+/// matmuls run at TF32 unless `MLX_ENABLE_TF32=0`, and MLX 0.32 routes more shapes that way
+/// than 0.31 did. The full head forward measured 3.3e-3 on mlx-swift 0.31.4 and 5.4e-3 on
+/// 0.32.3 with TF32 on, and passes 5e-3 with it off; this bound covers the default.
+private let headForwardRelativeTolerance: Float = 1e-2
+
 @Suite("VibeVoice TTS")
 struct VibeVoiceTTSTests {
 
@@ -107,7 +113,7 @@ struct VibeVoiceTTSTests {
             condition: MLXArray(VibeVoiceHeadGolden.condition, [2, 8]))
         let expected = MLXArray(VibeVoiceHeadGolden.output, [2, 4])
         #expect(out.shape == expected.shape)
-        #expect(relativeError(out, expected) < gpuRelativeTolerance)
+        #expect(relativeError(out, expected) < headForwardRelativeTolerance)
     }
 
     /// The factory has to route both the checkpoint's `model_type` and the repo name.
