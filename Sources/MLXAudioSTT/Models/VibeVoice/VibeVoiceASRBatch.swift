@@ -30,9 +30,14 @@ extension VibeVoiceASRModel {
     /// Each recording is encoded and prompted exactly as `generate` does. The prompts are then
     /// left-padded to a common length so every row shares the cache position, and a mask hides
     /// the padding from the real tokens. RoPE scores depend only on relative position, so the
-    /// shift padding introduces does not change attention in exact arithmetic; in floating
-    /// point the batched matmuls sum in a different order, so a near-tie can resolve
-    /// differently than in the single-row decode.
+    /// shift padding introduces does not change attention.
+    ///
+    /// Exactness depends on the matmul precision, not on batching. On GPUs with NAX matrix
+    /// units (M5), MLX runs float32 matmuls at TF32 unless `MLX_ENABLE_TF32=0`, and from MLX
+    /// 0.32 that includes the M = 2…8 decode matmuls a batch makes, while single-row decode
+    /// (M = 1) stays float32. With `MLX_ENABLE_TF32=0`, batches of 4 and 8 reproduced the
+    /// single-row float32 transcripts exactly (eight 300 s lecture chunks); with TF32 on,
+    /// batch 8 differed by one word in 5,833.
     ///
     /// Greedy without a repetition penalty only (what file transcription uses); rows that
     /// finish keep stepping with the batch and their extra tokens are discarded.

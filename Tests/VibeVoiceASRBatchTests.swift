@@ -66,8 +66,9 @@ struct VibeVoiceASRBatchTests {
             } }.max()!
         }
 
-        // Row 0 is unpadded, so its difference is pure float32 reordering (batched vs
-        // single-row kernels): the noise floor. Padded rows must stay at that level, while
+        // Row 0 is unpadded, so its difference is pure kernel noise (batched vs single-row):
+        // the noise floor. That is ~5e-7 at true float32 but ~1e-3 under MLX's default TF32
+        // on NAX GPUs, hence a relative check. Padded rows must stay at that level, while
         // letting them see their padding must move them far beyond it.
         let masked = runBatch(hidePadding: true)
         let leaky = runBatch(hidePadding: false)
@@ -101,10 +102,10 @@ struct VibeVoiceASRBatchTests {
 ///   -only-testing:'MLXAudioTests/VibeVoiceASRBatchCheckpointTests'
 /// ```
 ///
-/// Batched matmuls sum in a different order than single-row ones, so a token the model is
-/// almost evenly split on can in principle resolve differently; measured on eight 300 s
-/// lecture chunks, batches of 2 and 4 matched exactly and 8 differed by one word in 5,833.
-/// Two short clips at batch 2 are expected to match exactly.
+/// Add `TEST_RUNNER_MLX_ENABLE_TF32=0` for true float32. With MLX's default TF32 on NAX GPUs
+/// (M5), batched decode matmuls run at TF32 while single-row decode stays float32, so a near
+/// tie can resolve differently (measured: batch 8, one word in 5,833); at true float32
+/// batches of 4 and 8 matched exactly. Two short clips at batch 2 are expected to match.
 @Suite("VibeVoice ASR batched decoding, checkpoint", .serialized)
 struct VibeVoiceASRBatchCheckpointTests {
 
