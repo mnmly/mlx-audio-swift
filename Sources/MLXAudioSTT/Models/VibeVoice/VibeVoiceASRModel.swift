@@ -310,10 +310,24 @@ public final class VibeVoiceASRModel: Module, @unchecked Sendable {
         }
 
         text = tokenizer.decode(tokens: pieces)
-        let segments = VibeVoiceASRPrompt.parse(text)
-        let elapsed = Date().timeIntervalSince(start)
-        let prefill = prefillEnd.timeIntervalSince(start)
+        return makeOutput(
+            text: text, promptLength: promptLength, generated: generated,
+            prefill: prefillEnd.timeIntervalSince(start),
+            elapsed: Date().timeIntervalSince(start),
+            parameters: generationParameters)
+    }
 
+    /// Parses a decoded transcript into the package's `STTOutput`, shared by the single and
+    /// batched decoders so both report identically.
+    func makeOutput(
+        text: String,
+        promptLength: Int,
+        generated: Int,
+        prefill: Double,
+        elapsed: Double,
+        parameters generationParameters: STTGenerateParameters
+    ) -> STTOutput {
+        let segments = VibeVoiceASRPrompt.parse(text)
         return STTOutput(
             text: segments.isEmpty ? text : VibeVoiceASRPrompt.plainText(segments),
             segments: segments.map { segment in

@@ -203,10 +203,13 @@ public final class VibeVoiceQwen2Model: Module {
         return embedTokens(inputIds)
     }
 
+    /// - Parameter mask: overrides the causal mask derived from `cache`. Batched decoding of
+    ///   left-padded prompts passes one that also hides each row's padding.
     public func callAsFunction(
         inputIds: MLXArray? = nil,
         inputsEmbeds: MLXArray? = nil,
-        cache: [KVCache]? = nil
+        cache: [KVCache]? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
     ) -> MLXArray {
         var h: MLXArray
         if let inputsEmbeds {
@@ -217,7 +220,7 @@ public final class VibeVoiceQwen2Model: Module {
             fatalError("Either inputIds or inputsEmbeds must be provided")
         }
 
-        let mask = createAttentionMask(h: h, cache: cache?.first)
+        let mask = mask ?? createAttentionMask(h: h, cache: cache?.first)
         let caches = cache ?? [KVCache?](repeating: nil, count: layers.count)
         for (index, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: caches[index])
